@@ -8,7 +8,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use pdf_writer::{Chunk, Obj, Ref, Str};
+use pdf_writer::{Chunk, Finish, Name, Null, Obj, Ref, Str};
 use tiny_skia_path::Transform;
 
 use crate::error::KrillaResult;
@@ -18,6 +18,8 @@ use crate::serialize::{PageInfo, SerializeContext};
 /// The type of destination.
 #[derive(Hash)]
 pub enum Destination {
+    /// An XYZ destination written directly as an array.
+    XyzDirect(XyzDestination),
     /// An XYZ destination.
     Xyz(XyzDestination),
     /// A named destination.
@@ -27,6 +29,10 @@ pub enum Destination {
 impl Destination {
     pub(crate) fn serialize(&self, sc: &mut SerializeContext, buffer: Obj) -> KrillaResult<()> {
         match self {
+            Destination::XyzDirect(xyz) => {
+                xyz.serialize_direct(sc, buffer)?;
+                Ok(())
+            }
             Destination::Xyz(xyz) => {
                 let ref_ = sc.register_xyz_destination(xyz.clone());
                 buffer.primitive(ref_);
@@ -114,6 +120,45 @@ impl XyzDestination {
     /// targeted. If the `page_index` is out of range, export will fail gracefully.
     pub fn new(page_index: usize, point: Point) -> Self {
         Self(Arc::new(XyzDestRepr { page_index, point }))
+    }
+
+    pub(crate) fn serialize_direct(
+        &self,
+        sc: &mut SerializeContext,
+        buffer: Obj,
+    ) -> KrillaResult<()> {
+        let page_info = sc.page_infos().get(self.0.page_index).unwrap_or_else(|| {
+            panic!(
+                "attempted to link to page {}, but document only has {} pages",
+                self.0.page_index + 1,
+                sc.page_infos().len()
+            )
+        });
+
+        let (ref_, surface_size) = match page_info {
+            PageInfo::Krilla {
+                ref_, surface_size, ..
+            } => (ref_, surface_size),
+            PageInfo::Pdf { ref_, size, .. } => (ref_, size),
+        };
+
+        let page_ref = *ref_;
+        let page_size = surface_size.height();
+
+        let mut mapped_point = self.0.point.to_tsp();
+        // Convert to PDF coordinates
+        let invert_transform = Transform::from_row(1.0, 0.0, 0.0, -1.0, 0.0, page_size);
+        invert_transform.map_point(&mut mapped_point);
+
+        let mut arr = buffer.array();
+        arr.item(page_ref);
+        arr.item(Name(b"XYZ"));
+        arr.item(mapped_point.x);
+        arr.item(mapped_point.y);
+        arr.item(Null);
+        arr.finish();
+
+        Ok(())
     }
 
     pub(crate) fn serialize(
